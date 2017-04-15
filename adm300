@@ -1,0 +1,386 @@
+#!/usr/bin/python
+
+import argparse
+import datetime
+import os
+import pyadm300
+import Queue
+import time
+import threading
+import traceback
+
+# Set up command line interface.
+parser = argparse.ArgumentParser(description = "adm300 - A Canberra\NRC ADM-300 interface application.", epilog = "Specified options will override config.py.")
+parser.add_argument('-a', action = 'store_true', help = 'Silence audible alarm.')
+parser.add_argument('-c', action = 'store_true', help = 'Clear accumulated dose.')
+parser.add_argument('-d', action = 'store_true', help = 'Get accumulated dose.')
+parser.add_argument('-g', action = 'store_true', help = 'Get device parameters.')
+parser.add_argument('-r', action = 'store_true', help = 'Get continuous readings. This is the default behavior.')
+parser.add_argument('--gclr', action = 'store_true', help = 'Get and clear accumulated dose.')
+parser.add_argument('--autoalarm', action = 'store_true', help = 'Automatically silence audible alarm when back under thresholds.')
+#parser.add_argument('--csv', action='store_true', help = 'Output data to a CSV file. Not yet implemented.')
+#parser.add_argument('--db', type = str, default = "", help = 'Output to database specified in config.py. Not yet implemented.')
+parser.add_argument('--debug', action = 'store_true', help = 'Debug')
+parser.add_argument('--dev', type = str, default = "/dev/ttyUSB0", help = 'Use specified serial port. Overrides config.py and defaults to /dev/ttyUSB0. For Windows use COMx where x is the COM port in use.')
+#parser.add_argument('--flex', action = 'store_true', help = 'Submit data to Flextelem server specified in config.py. Not yet implemented.')
+#parser.add_argument('--nogps', action = 'store_true', help = "Don't store or poll GPS data even if it's available.")
+parser.add_argument('--raw', action = 'store_true', help = 'Dump raw sentences from the ADM-300 to the console.')
+parser.add_argument('--rawonly', action = 'store_true', help = 'Only dump raw sentences from the ADM-300 to the console.')
+#parser.add_argument('--setratealm', type = float, help = 'Set ADM-300 dose rate alarm threshold.')
+#parser.add_argument('--setdosealm', type = float, help = 'Set ADM-300 accumulated dose alarm threshold. Not yet implemented.')
+parser.add_argument('--startrep', action = 'store_true', help = 'Just send the ADM-300 the command to start reporting data.')
+parser.add_argument('--stoprep', action = 'store_true', help = 'Just send the ADM-300 the command to stop reporting data.')
+parser.add_argument('--wait', action = 'store_true', help = 'Wait for the ADM-300 to boot or for a data sentence before staring.')
+args = parser.parse_args()
+
+# Will we need to stop readings when we close?
+stopReadings = False
+
+# Fields that we want to store as status values. 
+statList = ['rateAlarmThresh', 'doseAlarmThresh']
+
+# Store status values which aren't provided in every sentence..
+adm300Stat = {}
+
+# List of alarms and descriptions.
+alDesc = {'battAlarm': 'Battery', 'doseAlarm': 'Dose', 'rateAlarm': 'Rate'}
+
+# Add None values for all the things we want to track.
+for stat in statList:
+    adm300Stat.update({stat: None})
+
+# Create a queue on which we can store readings.
+datQ = Queue.Queue()
+
+def toMetricStr(number):
+    """
+    Convert float to number with metric postfixes.
+    """
+    
+    # No postfix.
+    post = ""
+    
+    # Figure out if we're m or u.
+    if number < 0.001:
+        post = "u"
+        number *= 1000000
+    
+    elif number < 1:
+        post = "m"
+        number *= 1000
+    
+    # Build number string.
+    numStr = "%s %s" %(round(number, 3), post)
+    
+    return numStr
+
+def autoAlarm(reading):
+    """
+    Automatically reset the alarm when dose rate and accumulated dose flags are clear.
+    """
+    
+    # Clear alarm flag. Don't clear by default.
+    rtClear = False
+    dsClear = False
+    
+    # Now we check to make sure we know enough about the thresholds to clear alarms when they crop up.
+    if ('rateAlarmThresh' in adm300Stat) and ('doseAlarmThresh' in adm300Stat):
+        # If our dose rate has fallen below the threshold set the flag.
+        if reading['doseRt'] < adm300Stat['rateAlarmThresh']:
+            rtClear = True
+        else:
+            rtClear = False
+    
+        # If our dose rate has fallen below the threshold set the flag.
+        if reading['doseRt'] < adm300Stat['rateAlarmThresh']:
+            dsClear = True
+        else:
+            dsClear = False
+        
+        # If dose and rates are clear...
+        if rtClear and dsClear:
+            # Reset audible alarm.
+            a.clearAlarm()
+
+def enqueueReading(newReading):
+    """
+    Put a new reading on the queue, store certain values, and do event-driven logic.
+    """
+    try:
+        # Did we get a dict?
+        if (type(newReading) == dict) and (args.rawonly == False):
+            # Enqueue the stored reading.
+            datQ.put(newReading, block=False)
+            
+            # Search for and store properties that don't show up for every reading.
+            for aStat in statList:
+                if aStat in newReading:
+                    adm300Stat.update({aStat: newReading[aStat]})
+            
+        else:
+            # If we want raw readings of any kind...
+            if (args.raw) or (args.rawonly):
+                # Empty message.
+                msg = ""
+                
+                if len(newReading) != 47:
+                    msg = " (Incorrect string length.)"
+                
+                # And the data on the queue is a string...
+                if type(newReading) == str: print("Raw: \"%s\"%s" %(newReading, msg))
+    
+    except:
+        print("Failed to enqueue incoming reading:\n%s" %traceback.format_exc())
+    
+    return
+
+def getDose(clear=False):
+    """
+    Get accumulated dose from ADM-300 and optionally clear it.
+    """
+    
+    # Wait for reading?
+    wait = True
+    
+    if args.debug: print("Get reports...")
+    
+    try:
+        # Start getting reports.
+        a.startReports()
+        
+        # Wait until we get a good reading.
+        while wait:
+            try:
+                # Get the last report.
+                lr = datQ.get(timeout=4)
+                
+                # Did we get a processed reading?
+                if type(lr) == dict:
+                    # If we have a valid reading...
+                    if lr['valid'] == True:
+                        if args.debug: print("Got a reading.")
+                        
+                        print("Accumulated dose: %s%s" %(toMetricStr(lr['doseAcc']), lr['doseUnit']))
+                        
+                        # In the event we want to get-and-clear the dose clear the dose.
+                        if clear == True:
+                            if args.debug: print("Clearing dose...")
+                            
+                            # Cleardose.
+                            a.clearDose()
+                        
+                        # Got a reading. We're done.
+                        wait = False
+            
+            except Queue.Empty:
+                print("Timed out waiting for a reading.")
+                wait = False
+            
+            except (KeyboardInterrupt, SystemExit):
+                wait = False
+            
+            except:
+                print("Unhandled exception trying to get accumulated dose:\n%s" %traceback.format_exc())
+                wait = False
+        
+        if args.debug: print("Stop reports...")
+        
+        # Stop reports.
+        a.stopReports()
+    
+    except:
+        raise
+
+def getReadings():
+    """
+    Get readings from the ADM-300.
+    """
+    
+    # Wait for reading?
+    wait = True
+    
+    if args.debug: print("Get readings...")
+    
+    try:
+        # Start getting reports.
+        a.startReports()
+        
+        # Wait until we get a good reading.
+        while wait:
+            try:
+                # Get the last report.
+                lr = datQ.get(timeout=4)
+                
+                # Did we get a processed reading?
+                if type(lr) == dict:
+                    # If we have a valid reading...
+                    if lr['valid'] == True:
+                        if args.debug: print("Got a reading.")
+                        
+                        # Check for alarms.
+                        alTrig = []
+                        
+                        # Check each alarm field....
+                        for alKey in ['battAlarm', 'doseAlarm', 'rateAlarm']:
+                            # If one is triggered add it to the list.
+                            if lr[alKey] == True:
+                                # Add the alarm.
+                                alTrig.append(alDesc[alKey])
+                        
+                        # Now we format the incoming readings.
+                        print("***")
+                        print("Current probe       : %s (%s)" %(lr['probe'], lr['probeFlag']))
+                        print("Dose rate           : %s%s/hr" %(toMetricStr(lr['doseRt']), lr['doseUnit']))
+                        print("Accumulated dose    : %s%s" %(toMetricStr(lr['doseAcc']), lr['doseUnit']))
+                        print("Unfiltered dose rate: %s%s/hr" %(toMetricStr(lr['doseRtUnf']), lr['doseUnit']))
+                        
+                        # Do we have an active alarm?
+                        if len(alTrig) > 0:
+                            # If we have alarms check to make sure we still want to squawk.
+                            if args.autoalarm:
+                                autoAlarm(lr)
+                            
+                            alStr = ", ".join(alTrig)
+                            print("Alarms active       : %s" %alStr)
+            
+            except Queue.Empty:
+                print("Timed out waiting for a reading.")
+                wait = False
+            
+            except (KeyboardInterrupt, SystemExit):
+                wait = False
+            
+            except:
+                print("Unhandled exception trying to get accumulated dose:\n%s" %traceback.format_exc())
+                wait = False    
+    except:
+        raise
+
+try:
+    # ADM-300 communication object, and hook callback function.
+    a = pyadm300.adm300comm(dev=args.dev, debug=args.debug)
+    
+    # Set up callback for enqueueing readings.
+    a.setCallback(enqueueReading)
+    a.setRawCallback(enqueueReading)
+    
+    # Open device communications.
+    a.begin()
+    
+    # Do we wait before running the command for the unit to boot or emit data?
+    if args.wait:
+        # Wait flag.
+        waitForBoot = True
+        
+        print("Waiting for ADM-300...")
+        
+        # Wait until we have a reading or boot event.
+        while waitForBoot:
+            # If either flag is set
+            if a.gotPowerOn:
+                # Break out of the loop and wait for ADM-300 to settle.
+                waitForBoot = False
+                time.sleep(3)
+            
+            elif a.gotSentence:
+                # Break out of the loop.
+                waitForBoot = False
+            
+            else:
+                # Don't suck up CPU.
+                time.sleep(0.01)
+        
+        if args.debug: print("Proceeding...")
+
+    # Determine what operation we're trying to do.
+    # This block also determines our order of operations.
+    if args.c == True:
+        print("Clear accumulated dose...")
+        a.clearDose()
+        
+        # Give time for the commands to complete.
+        time.sleep(1)
+    
+    elif args.a == True:
+        print("Clear audible alarm...")
+        a.clearAlarm()
+        
+        # Give time for the commands to complete.
+        time.sleep(1)
+    
+    elif (args.gclr == True) or (args.d == True):
+        print("Get accumulated dose then clear it...")
+        try:
+            # Get dose, and set the clear flag to whatever args.gclr is set to.
+            getDose(args.gclr)
+            
+            # Give time for the commands to complete.
+            time.sleep(1)
+        
+        except:
+            print("Unable to get reading:\n%s" %traceback.format_exc())
+    
+    elif args.r == True:
+        print("Show reports...")
+        # Flag as long-running task.
+        stopReadings = True
+        
+        # Call the readings.
+        getReadings()
+    
+    elif args.rawonly:
+        print("Dump raw sentences only. Press Ctrl+C to quit.")
+        # Flag as long-running task.
+        stopReadings = True
+        
+        # Loop until Ctrl+C
+        while True:
+            time.sleep(1)
+    
+    elif args.startrep:
+        print("Send start report command and exit.")
+        
+        # Send start report command and drop out.
+        a.startReports()
+        
+        # Give time for the commands to complete.
+        time.sleep(1)
+    
+    elif args.stoprep:
+        print("Send stop report command and exit.")
+        
+        # Send start report command and drop out.
+        a.stopReports()
+        
+        # Give time for the commands to complete.
+        time.sleep(1)
+
+except (KeyboardInterrupt, SystemExit):
+    if args.debug: print("Caught exit signal.")
+    print("")
+
+except:
+    print("Failure:\n%s" %traceback.format_exc())
+
+finally:
+    # If we need to stop readings...
+    if stopReadings:
+        try:
+            if args.debug: print("Stop reports...")
+            # Send stop command.
+            a.stopReports()
+            
+            # Give the thread time to handle the command.
+            time.sleep(2)
+        
+        except:
+            None
+    
+    try:
+        # Kill the library.
+        a.kill()
+    
+    except:
+        None
+
+if args.debug: print("Quit.")
